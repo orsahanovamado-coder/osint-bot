@@ -1,0 +1,650 @@
+import os
+import re
+import json
+import socket
+import ipaddress
+from urllib.parse import quote_plus, urlparse
+
+import aiohttp
+from bs4 import BeautifulSoup
+from telegram import Update
+from telegram.constants import ChatAction
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
+
+TOKEN = os.getenv("BOT_TOKEN")
+
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set")
+
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (OSINT Research Bot)"
+}
+
+
+async def get_json(session, url, params=None):
+    try:
+        async with session.get(
+            url,
+            params=params,
+            headers=HEADERS,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as r:
+            return await r.json(content_type=None)
+    except Exception:
+        return None
+
+
+def chunks(text, size=3900):
+    for i in range(0, len(text), size):
+        yield text[i:i + size]
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = """
+🔎 OSINT Assistant
+
+Бот работает с открытыми источниками.
+
+Команды:
+
+/search запрос
+Поиск информации в интернете.
+
+/ip 8.8.8.8
+Информация об IP.
+
+/dns example.com
+DNS-записи домена.
+
+/whois example.com
+Базовая информация о домене.
+
+/crt example.com
+Поиск сертификатов и поддоменов через Certificate Transparency.
+
+/resolve example.com
+Получение IP-адресов домена.
+
+/url https://example.com
+Базовый анализ URL и HTTP-ответа.
+
+/help
+Список команд.
+
+⚠️ Используй бот только для законного исследования открытой информации.
+"""
+    await update.message.reply_text(text)
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start(update, context)
+
+
+async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Использование:\n/search запрос"
+        )
+        return
+
+    query = " ".join(context.args)
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+
+    url = "https://html.duckduckgo.com/html/"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                data={"q": query},
+                headers=HEADERS,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as response:
+
+                html = await response.text()
+
+        soup = BeautifulSoup(html, "html.parser")
+        results = []
+
+        for result in soup.select(".result"):
+            a = result.select_one(".result__a")
+            snippet = result.select_one(".result__snippet")
+
+            if not a:
+                continue
+
+            title = a.get_text(" ", strip=True)
+            link = a.get("href", "")
+            description = (
+                snippet.get_text(" ", strip=True)
+                if snippet
+                else ""
+            )
+
+            results.append(
+                f"🔹 {title}\n"
+                f"{link}\n"
+                f"{description}"
+            )
+
+            if len(results) >= 8:
+                break
+
+        if not results:
+            await update.message.reply_text(
+                "Ничего не найдено или поисковик временно недоступен."
+            )
+            return
+
+        output = f"🔎 Результаты: {query}\n\n"
+        output += "\n\n".join(results)
+
+        for part in chunks(output):
+            await update.message.reply_text(part)
+
+    except Exception as e:
+        await update.message.reply_text(
+            f"Ошибка поиска: {type(e).__name__}"
+        )
+
+
+async def ip_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Использование:\n/ip 8.8.8.8"
+        )
+        return
+
+    value = context.args[0].strip()
+
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        await update.message.reply_text("Некорректный IP.")
+        return
+
+    if ip.is_private or ip.is_loopback or ip.is_reserved:
+        await update.message.reply_text(
+            "Это внутренний/зарезервированный IP. "
+            "Публичная геолокация для него не имеет смысла."
+        )
+        return
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+
+    async with aiohttp.ClientSession() as session:
+        data = await get_json(
+            session,
+            f"https://ipwho.is/{ip}"
+        )
+
+    if not data or not data.get("success", False):
+        await update.message.reply_text(
+            "Не удалось получить информацию."
+        )
+        return
+
+    connection = data.get("connection") or {}
+
+    text = f"""
+🌐 IP OSINT
+
+IP: {data.get("ip", "-")}
+Type: {data.get("type", "-")}
+
+Страна: {data.get("country", "-")}
+Регион: {data.get("region", "-")}
+Город: {data.get("city", "-")}
+Почтовый индекс: {data.get("postal", "-")}
+
+Latitude: {data.get("latitude", "-")}
+Longitude: {data.get("longitude", "-")}
+
+ISP: {connection.get("isp", "-")}
+Организация: {connection.get("org", "-")}
+ASN: {connection.get("asn", "-")}
+Тип: {connection.get("type", "-")}
+
+Timezone: {(data.get("timezone") or {}).get("id", "-")}
+"""
+
+    await update.message.reply_text(text)
+
+
+async def resolve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Использование:\n/resolve example.com"
+        )
+        return
+
+    domain = context.args[0].strip().lower()
+
+    if not re.fullmatch(
+        r"[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
+        domain
+    ):
+        await update.message.reply_text("Некорректный домен.")
+        return
+
+    try:
+        infos = await __import__("asyncio").to_thread(
+            socket.getaddrinfo,
+            domain,
+            None,
+        )
+
+        addresses = sorted(
+            {
+                item[4][0]
+                for item in infos
+            }
+        )
+
+        result = "\n".join(
+            f"• {x}" for x in addresses
+        )
+
+        await update.message.reply_text(
+            f"🌐 DNS Resolve\n\n"
+            f"Домен: {domain}\n\n"
+            f"{result or 'IP не найден.'}"
+        )
+
+    except Exception as e:
+        await update.message.reply_text(
+            f"Ошибка: {type(e).__name__}"
+        )
+
+
+async def dns(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Использование:\n/dns example.com"
+        )
+        return
+
+    domain = context.args[0].strip().lower()
+
+    if not re.fullmatch(
+        r"[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
+        domain
+    ):
+        await update.message.reply_text("Некорректный домен.")
+        return
+
+    record_types = ["A", "AAAA", "MX", "NS", "TXT", "CNAME"]
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+
+    lines = [f"🧬 DNS: {domain}\n"]
+
+    async with aiohttp.ClientSession() as session:
+
+        for record_type in record_types:
+            data = await get_json(
+                session,
+                "https://dns.google/resolve",
+                {
+                    "name": domain,
+                    "type": record_type,
+                },
+            )
+
+            answers = (data or {}).get("Answer", [])
+
+            if answers:
+                lines.append(f"【{record_type}】")
+
+                for answer in answers[:10]:
+                    value = answer.get("data", "")
+                    lines.append(f"• {value}")
+
+                lines.append("")
+
+    await update.message.reply_text(
+        "\n".join(lines)
+    )
+
+
+async def crt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Использование:\n/crt example.com"
+        )
+        return
+
+    domain = context.args[0].strip().lower()
+
+    if not re.fullmatch(
+        r"[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
+        domain
+    ):
+        await update.message.reply_text("Некорректный домен.")
+        return
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+
+    url = "https://crt.sh/"
+
+    async with aiohttp.ClientSession() as session:
+        data = await get_json(
+            session,
+            url,
+            {
+                "q": f"%.{domain}",
+                "output": "json",
+            },
+        )
+
+    if not isinstance(data, list):
+        await update.message.reply_text(
+            "Certificate Transparency временно недоступен."
+        )
+        return
+
+    names = set()
+
+    for cert in data:
+        value = cert.get("name_value", "")
+
+        for name in value.splitlines():
+            name = name.strip().lower()
+
+            if name.startswith("*."):
+                name = name[2:]
+
+            if name.endswith(domain):
+                names.add(name)
+
+    names = sorted(names)
+
+    if not names:
+        await update.message.reply_text(
+            "Поддомены через CT не найдены."
+        )
+        return
+
+    output = (
+        f"🔐 Certificate Transparency\n\n"
+        f"Домен: {domain}\n\n"
+    )
+
+    output += "\n".join(
+        f"• {name}" for name in names[:150]
+    )
+
+    for part in chunks(output):
+        await update.message.reply_text(part)
+
+
+async def whois(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Использование:\n/whois example.com"
+        )
+        return
+
+    domain = context.args[0].strip().lower()
+
+    if not re.fullmatch(
+        r"[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
+        domain
+    ):
+        await update.message.reply_text("Некорректный домен.")
+        return
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(
+                f"https://rdap.org/domain/{domain}",
+                headers=HEADERS,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as response:
+
+                data = await response.json(
+                    content_type=None
+                )
+
+        except Exception as e:
+            await update.message.reply_text(
+                f"RDAP недоступен: {type(e).__name__}"
+            )
+            return
+
+    if not isinstance(data, dict):
+        await update.message.reply_text(
+            "Данные домена не получены."
+        )
+        return
+
+    status = data.get("status", [])
+
+    registrar = "-"
+
+    for entity in data.get("entities", []):
+        if "registrar" in entity.get("roles", []):
+            vcard = entity.get("vcardArray", [])
+
+            if len(vcard) > 1:
+                for item in vcard[1]:
+                    if (
+                        isinstance(item, list)
+                        and len(item) > 3
+                        and item[0] == "fn"
+                    ):
+                        registrar = item[3]
+                        break
+
+    events = {}
+
+    for event in data.get("events", []):
+        action = event.get("eventAction")
+        date = event.get("eventDate")
+
+        if action and date:
+            events[action] = date
+
+    text = f"""
+📋 RDAP / WHOIS
+
+Домен: {data.get("ldhName", domain)}
+
+Registrar:
+{registrar}
+
+Статусы:
+{chr(10).join("• " + x for x in status) or "-"}
+
+Создан:
+{events.get("registration", "-")}
+
+Изменён:
+{events.get("last changed", "-")}
+
+Истекает:
+{events.get("expiration", "-")}
+"""
+
+    await update.message.reply_text(text)
+
+
+async def url_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Использование:\n/url https://example.com"
+        )
+        return
+
+    target = context.args[0].strip()
+
+    if not target.startswith(("http://", "https://")):
+        target = "https://" + target
+
+    parsed = urlparse(target)
+
+    if not parsed.hostname:
+        await update.message.reply_text(
+            "Некорректный URL."
+        )
+        return
+
+    # Защита от обращения к localhost/private networks.
+    try:
+        addresses = socket.getaddrinfo(
+            parsed.hostname,
+            None,
+        )
+
+        for item in addresses:
+            ip = ipaddress.ip_address(item[4][0])
+
+            if (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_reserved
+            ):
+                await update.message.reply_text(
+                    "URL указывает на внутренний или "
+                    "зарезервированный адрес."
+                )
+                return
+
+    except Exception:
+        pass
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                target,
+                headers=HEADERS,
+                allow_redirects=True,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as response:
+
+                final_url = str(response.url)
+                body = await response.text(
+                    errors="ignore"
+                )
+
+                soup = BeautifulSoup(
+                    body,
+                    "html.parser"
+                )
+
+                title = (
+                    soup.title.get_text(
+                        " ",
+                        strip=True
+                    )
+                    if soup.title
+                    else "-"
+                )
+
+                headers = response.headers
+
+                text = f"""
+🔗 URL Analysis
+
+Исходный URL:
+{target}
+
+Конечный URL:
+{final_url}
+
+HTTP:
+{response.status}
+
+Content-Type:
+{headers.get("Content-Type", "-")}
+
+Server:
+{headers.get("Server", "-")}
+
+Content-Length:
+{headers.get("Content-Length", "-")}
+
+Title:
+{title[:500]}
+"""
+
+                await update.message.reply_text(text)
+
+    except Exception as e:
+        await update.message.reply_text(
+            f"Ошибка анализа URL: {type(e).__name__}"
+        )
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    print(
+        "ERROR:",
+        repr(context.error)
+    )
+
+
+def main():
+    application = (
+        Application.builder()
+        .token(TOKEN)
+        .build()
+    )
+
+    application.add_handler(
+        CommandHandler("start", start)
+    )
+
+    application.add_handler(
+        CommandHandler("help", help_command)
+    )
+
+    application.add_handler(
+        CommandHandler("search", search)
+    )
+
+    application.add_handler(
+        CommandHandler("ip", ip_lookup)
+    )
+
+    application.add_handler(
+        CommandHandler("dns", dns)
+    )
+
+    application.add_handler(
+        CommandHandler("resolve", resolve)
+    )
+
+    application.add_handler(
+        CommandHandler("whois", whois)
+    )
+
+    application.add_handler(
+        CommandHandler("crt", crt)
+    )
+
+    application.add_handler(
+        CommandHandler("url", url_info)
+    )
+
+    application.add_error_handler(error_handler)
+
+    print("OSINT bot started")
+
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
+
+
+if __name__ == "__main__":
+    main()
